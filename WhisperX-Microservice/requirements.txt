@@ -1,0 +1,21 @@
+# Dependencias base
+fastapi==0.110.0
+pydantic==2.6.1
+google-cloud-storage==2.14.0
+google-cloud-pubsub==2.19.0
+supabase==2.4.0
+psycopg[binary,pool]==3.1.18
+uvicorn==0.27.0
+python-dotenv==1.0.1
+starlette==0.36.3
+
+# Dependencias de WhisperX
+whisperx==3.1.1
+torch==2.2.0+cu121  # Para RTX 4060 local (CUDA 12.1), ajustado en Dockerfile para producción
+torchaudio==2.2.0+cu121
+faster-whisper==1.0.3  # Versión específica compatible con whisperx 3.1.1
+ctranslate2==4.4.0    # Última versión compatible
+transformers==4.44.2  # Versión estable
+pandas==2.2.3         # Versión reciente
+setuptools==75.1.0    # Última versión estable
+nltk==3.9.1           # Última versión

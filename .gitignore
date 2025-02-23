@@ -1,0 +1,5 @@
+# Ignorar el archivo de variables de entorno
+WhisperX-Microservice/.env
+
+# Ignorar el archivo de credenciales JSON
+WhisperX-Microservice/nyro-450117-84821c1cf7ee.json
