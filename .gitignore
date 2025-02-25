@@ -3,3 +3,6 @@ WhisperX-Microservice/.env
 
 # Ignorar el archivo de credenciales JSON
 WhisperX-Microservice/nyro-450117-84821c1cf7ee.json
+
+# Ignorar el bucket de Google Cloud Storage
+WhisperX-Microservice/bucket_iam.json
