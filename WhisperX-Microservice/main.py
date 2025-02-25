@@ -56,11 +56,11 @@ try:
     from google.api_core import retry
     from supabase import create_client, Client
     import torch
+    import re
     import threading
     import tempfile
     import whisperx
     import uvicorn
-    from starlette.middleware.timeout import TimeoutMiddleware
     from dotenv import load_dotenv
     import psycopg
     from psycopg_pool import AsyncConnectionPool
@@ -71,6 +71,8 @@ except ImportError as e:
 
 # Load environment variables from .env file
 load_dotenv()
+
+pending_tasks = set()
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -83,7 +85,7 @@ class TierType(str, Enum):
 
 @lru_cache()
 def get_env_config():
-    """Get and validate all required environment variables"""
+    """Get and validate all required environment variables, including service account credentials"""
     required_vars = {
         "SUPABASE_URL": os.getenv("SUPABASE_URL"),
         "SUPABASE_KEY": os.getenv("SUPABASE_KEY"),
@@ -97,6 +99,21 @@ def get_env_config():
     if missing:
         raise ValueError(f"Missing required environment variables: {', '.join(missing)}")
     
+    # Verificar archivo de credenciales de Google Cloud
+    credentials_path = required_vars["GOOGLE_APPLICATION_CREDENTIALS"]
+    if not os.path.isfile(credentials_path):
+        raise ValueError(f"Service account credentials file does not exist: {credentials_path}")
+    
+    try:
+        with open(credentials_path, 'r') as f:
+            credentials_data = json.load(f)
+            service_account_id = credentials_data.get("client_email", "Unknown")
+            logger.info(f"Using service account: {service_account_id} from {credentials_path}")
+    except json.JSONDecodeError:
+        raise ValueError(f"Invalid JSON in service account credentials file: {credentials_path}")
+    except Exception as e:
+        raise ValueError(f"Error reading service account credentials file {credentials_path}: {str(e)}")
+    
     return required_vars
 
 # Initialize FastAPI
@@ -106,16 +123,12 @@ app = FastAPI(
     version="1.0.0",
     on_startup=[get_env_config]
 )
-app.add_middleware(TimeoutMiddleware, timeout=600)
 
 # Initialize Supabase
 supabase: Client = create_client(
     os.getenv("SUPABASE_URL"),
     os.getenv("SUPABASE_KEY")
 )
-
-# Initialize PostgreSQL connection pool
-db_pool = AsyncConnectionPool(os.getenv("DATABASE_URL"), min_size=2, max_size=10)
 
 class JobStatus(str, Enum):
     PENDING = "pending"
@@ -145,8 +158,8 @@ class TranscriptionJob(BaseModel):
 
     @validator('ruta_audio')
     def validate_ruta_audio(cls, v):
-        if not v.startswith('gs://'):
-            raise ValueError("ruta_audio debe comenzar con gs://")
+        if not (v.startswith('gs://') or v.startswith('https://storage.googleapis.com/')):
+            raise ValueError("ruta_audio debe comenzar con gs:// o https://storage.googleapis.com/")
         return v
 
     class Config:
@@ -161,33 +174,53 @@ class PubSubMessage(BaseModel):
 
 # GCS helpers
 def parse_gcs_url(gcs_url: str) -> tuple[str, str]:
-    if not gcs_url.startswith("gs://"):
-        raise ValueError("La URL debe iniciar con gs://")
-    parts = gcs_url[5:].split("/", 1)
-    return parts[0], parts[1] if len(parts) > 1 else ""
+    """Parse GCS URL (gs:// or https://storage.googleapis.com/) into bucket and blob name"""
+    if gcs_url.startswith("gs://"):
+        if len(gcs_url) <= 5:
+            raise ValueError("La URL gs:// está vacía o incompleta")
+        parts = gcs_url[5:].split("/", 1)
+        return parts[0], parts[1] if len(parts) > 1 else ""
+    elif gcs_url.startswith("https://storage.googleapis.com/"):
+        if len(gcs_url) <= 31:
+            raise ValueError("La URL HTTPS está vacía o incompleta")
+        parts = gcs_url[31:].split("/", 1)
+        return parts[0], parts[1] if len(parts) > 1 else ""
+    else:
+        raise ValueError("La URL debe comenzar con gs:// o https://storage.googleapis.com/")
 
 async def download_from_gcs(gcs_url: str, local_path: str) -> None:
-    """Download file from GCS asynchronously"""
+    """Download file from GCS asynchronously with improved handling"""
     bucket_name, blob_name = parse_gcs_url(gcs_url)
     client = storage.Client()
     bucket = client.bucket(bucket_name)
     blob = bucket.blob(blob_name)
-    
-    # Implement retry logic
-    @retry.Retry(predicate=retry.if_exception_type(Exception))
+
+    # Verificar si el archivo ya existe localmente y es válido
+    if os.path.exists(local_path):
+        logger.warning(f"El archivo {local_path} ya existe, se sobrescribirá")
+
+    # Implementar reintentos y descargar
+    @retry.Retry(predicate=retry.if_exception_type(Exception), initial=1.0, maximum=10.0, multiplier=2.0)
     def download_with_retry():
+        # Opcional: Verificar existencia del blob antes de descargar
+        if not blob.exists():
+            raise FileNotFoundError(f"El objeto {blob_name} no existe en el bucket {bucket_name}")
         blob.download_to_filename(local_path)
-        
-    await asyncio.to_thread(download_with_retry)
-    logger.info(f"Downloaded {gcs_url} to {local_path}")
+
+    try:
+        await asyncio.to_thread(download_with_retry)
+        logger.info(f"Descargado {gcs_url} a {local_path}")
+    except Exception as e:
+        logger.error(f"Error descargando {gcs_url}: {str(e)}")
+        raise
 
 async def transcribe_audio(audio_path: str, tier: str) -> dict:
     """Transcribe audio using WhisperX based on tier"""
     device = "cuda" if torch.cuda.is_available() else "cpu"
     
     try:
-        # Add timeout to prevent long-running transcriptions
-        async with asyncio.timeout(300):  # 5 minutes
+        # Reemplazar asyncio.timeout con asyncio.wait_for para compatibilidad con Python 3.10
+        async def transcribe_with_timeout():
             if tier == "tier1":
                 model = whisperx.load_model("small", device, compute_type="int8")
                 audio = whisperx.load_audio(audio_path)
@@ -242,70 +275,95 @@ async def transcribe_audio(audio_path: str, tier: str) -> dict:
                 
             else:
                 raise ValueError(f"Invalid tier: {tier}")
+
+        # Usar wait_for con un timeout de 300 segundos (5 minutos)
+        return await asyncio.wait_for(transcribe_with_timeout(), timeout=300)
                 
+    except asyncio.TimeoutError:
+        logger.error("Transcription exceeded 5 minute timeout")
+        raise
     except Exception as e:
         logger.error(f"Transcription error: {str(e)}")
         raise
 
 async def upload_result_to_gcs(result: dict, user_id: str, job_id: str) -> str:
     try:
-        # Subir resultado completo a GCS
         client = storage.Client()
         bucket = client.bucket("whisperx-results")
-        blob_name = f"WX-results-transcript-{user_id}-{job_id}.json"
-        blob = bucket.blob(blob_name)
-        result_json = json.dumps(result, ensure_ascii=False)
-        blob.upload_from_string(result_json, content_type="application/json")
-        result_url = f"gs://whisperx-results/{blob_name}"
-        logger.info(f"Uploaded full result to {result_url}")
-
-        # Publicar notificación a Pub/Sub (usar transcription-jobs como en los requisitos)
-        publisher = pubsub_v1.PublisherClient()
-        topic_path = publisher.topic_path(os.getenv("GCP_PROJECT"), "transcription-jobs")
-        message_dict = {
-            "user_id": user_id,
-            "job_id": job_id,
-            "result_url": result_url,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "language": result.get("language", "unknown"),
-            "tier": result.get("tier", "unknown")
+        
+        user_folder = f"{user_id}/"
+        job_folder = f"{user_folder}{job_id}/"
+        
+        logger.info(f"Preparando subida de resultados para usuario {user_id}, job {job_id} en {job_folder}")
+        
+        files_to_upload = {
+            "transcript.json": json.dumps(result.get("transcription", {}), ensure_ascii=False),
+            "metadata.json": json.dumps({
+                "language": result.get("language", "unknown"),
+                "tier": result.get("tier", "unknown"),
+                "timestamp": datetime.now(timezone.utc).isoformat()
+            }, ensure_ascii=False),
         }
-        message_data = json.dumps(message_dict).encode("utf-8")
-        future = publisher.publish(topic_path, data=message_data)
-        message_id = future.result()
-        logger.info(f"Published notification to {topic_path} with ID: {message_id}")
-
+        
+        uploaded_urls = []
+        for filename, content in files_to_upload.items():
+            blob_name = f"{job_folder}{filename}"
+            blob = bucket.blob(blob_name)
+            logger.info(f"Subiendo {blob_name} a gs://whisperx-results/{blob_name}")
+            blob.upload_from_string(content, content_type="application/json")
+            
+            # No verificamos blob.exists() inmediatamente, confiamos en la subida
+            file_url = f"gs://whisperx-results/{blob_name}"
+            uploaded_urls.append(file_url)
+            logger.info(f"Archivo subido exitosamente: {file_url}")
+        
+        result_url = f"gs://whisperx-results/{job_folder}"
+        logger.info(f"Todos los archivos subidos a {result_url}")
+        
         return result_url
-    except Exception as e:
-        logger.error(f"Error uploading result to GCS: {str(e)}")
-        raise
         
     except Exception as e:
-        logger.error(f"Error uploading result to GCS: {str(e)}")
+        logger.error(f"Error subiendo resultados a GCS: {str(e)}. Bucket: whisperx-results, Job: {job_id}")
         raise
 
 # --- Supabase helpers ---
+async def get_archivo_id_from_ruta_audio(ruta_audio: str) -> Optional[str]:
+    """Obtiene el ID de archivos_subidos basado en la ruta_audio."""
+    try:
+        async with db_pool.connection() as conn:
+            query = """
+                SELECT id FROM archivos_subidos WHERE ruta_archivo = %s;
+            """
+            result = await conn.execute(query, (ruta_audio,))
+            row = await result.fetchone()
+            if row:
+                return row[0]
+            else:
+                logger.error(f"No se encontró un registro en archivos_subidos para ruta_audio: {ruta_audio}")
+                return None
+    except Exception as e:
+        logger.error(f"Error consultando archivos_subidos para ruta_audio {ruta_audio}: {str(e)}")
+        raise
 
 # Database connection helper
 async def get_db_connection():
     """Get a database connection from the pool"""
     async with db_pool.connection() as conn:
-        return conn
+        yield conn
     
 
 async def update_transcription_records(
     job_id: str,
     status: JobStatus,
     result: dict,
-    user_id: str
+    user_id: str,
+    ruta_audio: str  # Añadimos ruta_audio como parámetro
 ) -> None:
-    """Actualiza las tablas transcription_jobs y transcriptions usando psycopg en una transacción asíncrona."""
     try:
         now = datetime.now(timezone.utc)
         async with db_pool.connection() as conn:
             async with conn.transaction():
                 if status == JobStatus.FAILED:
-                    # Actualización en caso de error
                     update_query = """
                         UPDATE transcription_jobs
                         SET estado = %s,
@@ -321,6 +379,7 @@ async def update_transcription_records(
                         job_id
                     )
                     await conn.execute(update_query, update_params)
+                    logger.info(f"Job {job_id} marcado como FAILED en transcription_jobs")
                 elif status == JobStatus.COMPLETED and result:
                     transcription_data = result.get("transcription", {})
                     segments = transcription_data.get("segments", [])
@@ -337,8 +396,14 @@ async def update_transcription_records(
                     """
                     update_params = (status.value, now, job_id)
                     await conn.execute(update_query, update_params)
+                    logger.info(f"Job {job_id} actualizado a COMPLETED en transcription_jobs")
 
-                    # Inserta el registro en la tabla de transcriptions
+                    # Obtener el archivo_id desde archivos_subidos
+                    archivo_id = await get_archivo_id_from_ruta_audio(ruta_audio)
+                    if not archivo_id:
+                        raise ValueError(f"No se encontró archivo_id para ruta_audio: {ruta_audio}")
+
+                    # Inserta el registro en transcriptions usando archivo_id
                     transcription_id = str(uuid4())
                     insert_query = """
                         INSERT INTO transcriptions (id, archivo_id, texto_transcripcion, fecha_generacion, estado, idioma)
@@ -346,15 +411,15 @@ async def update_transcription_records(
                     """
                     insert_params = (
                         transcription_id,
-                        job_id,
+                        archivo_id,  # Usamos archivo_id en lugar de job_id
                         transcription_text,
                         now,
                         status.value,
                         transcription_data.get("language", "unknown")
                     )
                     await conn.execute(insert_query, insert_params)
+                    logger.info(f"Transcripción {transcription_id} registrada en transcriptions con archivo_id {archivo_id}")
                 else:
-                    # En otros casos, se actualiza sólo el estado
                     update_query = """
                         UPDATE transcription_jobs
                         SET estado = %s,
@@ -363,9 +428,9 @@ async def update_transcription_records(
                     """
                     update_params = (status.value, now, job_id)
                     await conn.execute(update_query, update_params)
-        logger.info(f"Updated job {job_id} with status {status.value}")
+                    logger.info(f"Job {job_id} actualizado a {status.value} en transcription_jobs")
     except Exception as e:
-        logger.error(f"Error updating transcription records: {str(e)}")
+        logger.error(f"Error actualizando registros: {str(e)}")
         raise
 
 
@@ -373,30 +438,45 @@ async def process_pubsub_message(message: PubSubMessage):
     """Process incoming Pub/Sub message"""
     job = None
     try:
-        message_data = base64.b64decode(message.message.get("data", "")).decode("utf-8")
-        job_data = json.loads(message_data)
-        
-        # Convert estado to JobStatus enum if needed
-        if "estado" in job_data:
-            job_data["estado"] = JobStatus(job_data["estado"])
-        
-        # Convert nivel to TierType enum if needed
+        job_data = message.message.get("data", "")
+        if not isinstance(job_data, dict):
+            raise ValueError(f"Los datos del mensaje deben ser un diccionario, recibido: {job_data}")
+
+        # Normalizar claves a minúsculas
+        job_data = {k.lower(): v for k, v in job_data.items()}
+
+        # Verificar si el mensaje tiene los campos obligatorios mínimos
+        required_fields = {"id", "id_usuario", "ruta_audio", "estado"}
+        if not all(field in job_data for field in required_fields):
+            logger.info(f"Descartando mensaje incompatible: {job_data}")
+            return {"status": "skipped", "reason": "incompatible_format"}
+
+        # Convertir valores con tolerancia a None
+        if job_data.get("estado"):
+            estado = job_data["estado"].lower()
+            if estado == "pendiente":
+                estado = "pending"
+            job_data["estado"] = JobStatus(estado)
         if job_data.get("nivel"):
             job_data["nivel"] = TierType(job_data["nivel"])
-            
-        # Convert date strings to datetime objects
         for date_field in ["fecha_creacion", "fecha_actualizacion"]:
             if job_data.get(date_field):
-                job_data[date_field] = datetime.fromisoformat(job_data[date_field].replace('Z', '+00:00'))
-        
-        job = TranscriptionJob(**job_data)
-        
+                try:
+                    job_data[date_field] = datetime.fromisoformat(job_data[date_field].replace('Z', '+00:00'))
+                except (ValueError, TypeError) as e:
+                    logger.warning(f"Error parsing {date_field}: {e}, usando valor por defecto")
+                    job_data[date_field] = datetime.now(timezone.utc)
+
+        # Crear el job con manejo de valores opcionales
+        job = TranscriptionJob(**{k: v for k, v in job_data.items() if v is not None})
+
         if job.intentos >= 3:
             await update_transcription_records(
                 job.id,
                 JobStatus.FAILED,
                 {"error": "Maximum retry attempts exceeded", "attempts": job.intentos},
-                job.id_usuario
+                job.id_usuario,
+                job.ruta_audio
             )
             return {"status": "failed", "reason": "max_retries"}
 
@@ -405,11 +485,12 @@ async def process_pubsub_message(message: PubSubMessage):
             job.id,
             JobStatus.COMPLETED,
             result,
-            job.id_usuario
+            job.id_usuario,
+            job.ruta_audio  # Pasamos ruta_audio aquí
         )
-        
+
         return {"status": "success", "job_id": job.id}
-        
+
     except Exception as e:
         logger.error(f"Error processing message: {e}")
         if job:
@@ -418,15 +499,14 @@ async def process_pubsub_message(message: PubSubMessage):
                 "error": str(e),
                 "attempts": job.intentos + 1
             }
-
             if current_attempts >= 3:
                 error_data["error"] = "Maximum retry attempts exceeded"
-
             await update_transcription_records(
                 job.id,
                 JobStatus.FAILED,
                 error_data,
-                job.id_usuario
+                job.id_usuario,
+                job.ruta_audio  # Pasamos ruta_audio aquí también
             )
         raise
 
@@ -437,11 +517,11 @@ async def process_transcription_job(job: TranscriptionJob) -> dict:
     try:
         await download_from_gcs(job.ruta_audio, local_audio_path)
         result = await transcribe_audio(local_audio_path, tier)
-        result["tier"] = tier  # Añadir tier al resultado
+        result["tier"] = tier
         result_path = await upload_result_to_gcs(result, job.id_usuario, job.id)
         return {
             "transcription": result,
-            "result_path": result_path
+            "result_path": result_path  # Esto ahora es la URL de la carpeta del job
         }
     finally:
         if os.path.exists(local_audio_path):
@@ -453,54 +533,172 @@ async def process_transcription_job(job: TranscriptionJob) -> dict:
 # Health check endpoint
 @app.get("/health")
 async def health_check():
+    health_status = {
+        "status": "healthy",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "services": {
+            "database": "unknown",
+            "supabase": "unknown",
+            "gcs": "unknown",
+            "pubsub": "unknown"
+        },
+        "errors": {},
+        "service_account": "unknown"  # Nuevo campo para mostrar la cuenta de servicio
+    }
+
+    # Obtener información de las credenciales
+    credentials_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+    if credentials_path and os.path.isfile(credentials_path):
+        try:
+            with open(credentials_path, 'r') as f:
+                credentials_data = json.load(f)
+                health_status["service_account"] = credentials_data.get("client_email", "Unknown")
+        except Exception as e:
+            health_status["errors"]["credentials"] = f"Error reading credentials: {str(e)}"
+
     try:
-        # Supabase
-        await supabase.table("transcription_jobs").select("id").limit(1).execute()
-        # Database
-        async with get_db_connection() as conn:
-            await conn.execute("SELECT 1")
-        # GCS
-        storage.Client().list_buckets(max_results=1)
-        # Pub/Sub (simple chequeo de suscripción)
-        subscriber = pubsub_v1.SubscriberClient()
-        subscriber.get_subscription(subscription="projects/nyro-450117/subscriptions/whisperx-microservice")
-        return {
-            "status": "healthy",
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "database": "connected",
-            "supabase": "connected",
-            "gcs": "connected",
-            "pubsub": "connected"
-        }
+        # Supabase check
+        data = supabase.table("transcription_jobs").select("id").limit(1).execute()
+        health_status["services"]["supabase"] = "connected"
     except Exception as e:
-        logger.error(f"Health check failed: {e}")
-        raise HTTPException(status_code=503, detail=f"Service unavailable: {str(e)}")
+        health_status["services"]["supabase"] = "disconnected"
+        health_status["errors"]["supabase"] = str(e)
+
+    try:
+        # Database check
+        async with db_pool.connection() as conn:
+            await conn.execute("SELECT 1")
+        health_status["services"]["database"] = "connected"
+    except Exception as e:
+        health_status["services"]["database"] = "disconnected"
+        health_status["errors"]["database"] = str(e)
+
+    try:
+        # GCS check
+        storage.Client().list_buckets(max_results=1)
+        health_status["services"]["gcs"] = "connected"
+    except Exception as e:
+        health_status["services"]["gcs"] = "disconnected"
+        health_status["errors"]["gcs"] = str(e)
+
+    try:
+        # Pub/Sub check
+        subscriber = pubsub_v1.SubscriberClient()
+        subscription = "projects/nyro-450117/subscriptions/whisperx-microservice"
+        subscriber.get_subscription(subscription=subscription)
+        health_status["services"]["pubsub"] = "connected"
+    except Exception as e:
+        health_status["services"]["pubsub"] = "disconnected"
+        health_status["errors"]["pubsub"] = str(e)
+
+    # Check if any service is disconnected
+    if any(status == "disconnected" for status in health_status["services"].values()):
+        health_status["status"] = "unhealthy"
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "message": "Service partially available or unavailable",
+                "status": health_status
+            }
+        )
+
+    return health_status
     
 # Cleanup resources
 @app.on_event("shutdown")
 async def cleanup_resources():
     """Cleanup resources on shutdown"""
+    global pending_tasks
+    if pending_tasks:
+        logger.info(f"Esperando {len(pending_tasks)} tareas pendientes...")
+        await asyncio.gather(*pending_tasks, return_exceptions=True)
     await db_pool.close()
+    logger.info("Recursos limpiados exitosamente")
+
+def fix_malformed_json(raw_data: str) -> dict:
+    """Convierte un mensaje malformado como {key:value,...} en un JSON válido."""
+    try:
+        # Eliminar llaves externas y limpiar espacios
+        cleaned_data = raw_data.strip().strip('{}').strip()
+        
+        # Usar regex para dividir pares clave-valor, preservando URLs y valores complejos
+        pattern = r'(\w+):([^,]+?(?=(?:,\w+:)|$))'
+        pairs = re.findall(pattern, cleaned_data)
+        
+        # Construir diccionario
+        result = {}
+        for key, value in pairs:
+            value = value.strip()
+            # Manejar valores especiales
+            if value == 'null':
+                result[key] = None
+            elif value.startswith('http') or value.startswith('gs://'):
+                result[key] = value  # Mantener URLs sin comillas adicionales
+            elif re.match(r'^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}', value):
+                result[key] = value  # Mantener fechas como cadenas
+            else:
+                result[key] = value.strip('"')  # Quitar comillas si las hay
+        
+        # Convertir a JSON y devolver
+        json_str = json.dumps(result)
+        return json.loads(json_str)
+    except Exception as e:
+        logger.error(f"Error reparando mensaje JSON: {e}")
+        raise ValueError(f"No se pudo reparar el mensaje: {e}")
 
 async def process_and_ack(pubsub_message):
+    task = asyncio.current_task()
+    pending_tasks.add(task)
     try:
-        decoded_data = base64.b64decode(pubsub_message.data).decode("utf-8")
+        raw_data = pubsub_message.data.decode("utf-8")
+        logger.info(f"Mensaje recibido (crudo): {raw_data}")
+        
+        try:
+            message_data = json.loads(raw_data)
+        except json.JSONDecodeError:
+            logger.warning(f"Parseando mensaje malformado: {raw_data}")
+            message_data = fix_malformed_json(raw_data)
+            logger.info(f"Mensaje reparado: {message_data}")
+
+        if not isinstance(message_data, dict):
+            logger.error(f"El mensaje reparado no es un diccionario: {message_data}")
+            pubsub_message.nack()
+            return
+
         message_wrapper = PubSubMessage(
-            message={"data": base64.b64encode(pubsub_message.data).decode("utf-8")},
-            subscription=pubsub_message.subscription
+            message={"data": message_data},
+            subscription="projects/nyro-450117/subscriptions/whisperx-microservice"
         )
+        
         await process_pubsub_message(message_wrapper)
         pubsub_message.ack()
+        logger.info(f"Mensaje procesado con éxito: {message_data.get('id', 'unknown')}")
     except Exception as e:
-        logger.error(f"Error procesando mensaje Pub/Sub desde {pubsub_message.subscription}: {e}")
+        logger.error(f"Error procesando mensaje Pub/Sub: {e}")
         pubsub_message.nack()
+    finally:
+        pending_tasks.remove(task)
 
 def pubsub_callback(message):
-    loop = asyncio.get_event_loop()
-    loop.run_until_complete(process_and_ack(message))
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        loop.run_until_complete(process_and_ack(message))
+    finally:
+        loop.close()
 
 def start_pubsub_listener():
     """Inicia el listener de Pub/Sub en un hilo separado."""
+    credentials_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+    if credentials_path and os.path.isfile(credentials_path):
+        try:
+            with open(credentials_path, 'r') as f:
+                credentials_data = json.load(f)
+                service_account_id = credentials_data.get("client_email", "Unknown")
+                logger.info(f"Starting Pub/Sub listener with service account: {service_account_id}")
+        except Exception as e:
+            logger.error(f"Error reading credentials for Pub/Sub listener: {str(e)}")
+    
     subscriber = pubsub_v1.SubscriberClient()
     subscription_path = "projects/nyro-450117/subscriptions/whisperx-microservice"
     future = subscriber.subscribe(subscription_path, pubsub_callback)
@@ -509,10 +707,12 @@ def start_pubsub_listener():
         future.result()
     except Exception as e:
         logger.error(f"Excepción en la escucha de {subscription_path}: {e}")
+        future.cancel()
 
 @app.on_event("startup")
-async def startup_pubsub_listener():
-    """Inicia el listener de Pub/Sub en un hilo aparte al arrancar la aplicación."""
+async def startup_event():
+    global db_pool
+    db_pool = AsyncConnectionPool(os.getenv("DATABASE_URL"), min_size=2, max_size=10)
     thread = threading.Thread(target=start_pubsub_listener, daemon=True)
     thread.start()
 
